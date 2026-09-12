@@ -1,0 +1,9 @@
+{
+  "name": "raskolink-browser-resolver",
+  "private": true,
+  "version": "1.0.0",
+  "description": "RaskoLink browser-based shortlink resolver",
+  "dependencies": {
+    "playwright": "1.55.0"
+  }
+}
