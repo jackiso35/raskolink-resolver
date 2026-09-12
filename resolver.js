@@ -15,6 +15,14 @@ const intermediate = new Set([
   'track.cdnue.com','cdnue.com'
 ]);
 
+const noiseHosts = new Set([
+  't.ly','www.t.ly','help.t.ly','chromewebstore.google.com','play.google.com','apps.apple.com',
+  'google.com','www.google.com','googleapis.com','gstatic.com','fonts.googleapis.com',
+  'fonts.gstatic.com','github.com','www.github.com','facebook.com','www.facebook.com',
+  'x.com','twitter.com','linkedin.com','www.linkedin.com','youtube.com','www.youtube.com',
+  'cloudflare.com','www.cloudflare.com'
+]);
+
 function hostOf(url) {
   try { return new URL(url).hostname.toLowerCase().replace(/^www\./,''); } catch { return ''; }
 }
@@ -24,7 +32,49 @@ function isIntermediate(host, sourceHost='') {
   for (const h of intermediate) if (host === h || host.endsWith('.' + h)) return true;
   return false;
 }
+function isNoiseHost(host) {
+  if (!host) return true;
+  for (const h of noiseHosts) if (host === h || host.endsWith('.' + h)) return true;
+  return false;
+}
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+function extractUrls(value, out = []) {
+  if (value == null) return out;
+  if (typeof value === 'string') {
+    const rx = /https?:\/\/[^\s"'<>\\)\]]+/gi;
+    const matches = value.match(rx) || [];
+    for (let u of matches) {
+      u = u.replace(/[.,;:!?]+$/,'');
+      if (!out.includes(u)) out.push(u);
+    }
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (const v of value) extractUrls(v, out);
+    return out;
+  }
+  if (typeof value === 'object') {
+    for (const v of Object.values(value)) extractUrls(v, out);
+  }
+  return out;
+}
+
+function pickBestCandidate(urls, sourceUrl) {
+  const sourceHost = hostOf(sourceUrl);
+  const usable = [];
+  for (const u of urls) {
+    let parsed;
+    try { parsed = new URL(u); } catch { continue; }
+    const h = parsed.hostname.toLowerCase().replace(/^www\./,'');
+    if (!h || h === sourceHost || isIntermediate(h, sourceHost) || isNoiseHost(h)) continue;
+    if (['localhost','127.0.0.1','0.0.0.0','::1'].includes(h)) continue;
+    // Ignore obvious static/CDN assets even if they are on a different host.
+    if (/\.(?:js|css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf)(?:$|\?)/i.test(parsed.pathname)) continue;
+    usable.push(u);
+  }
+  return usable.length ? usable[usable.length - 1] : '';
+}
 
 async function callback(payload) {
   const r = await fetch(CALLBACK_URL, {
@@ -37,9 +87,111 @@ async function callback(payload) {
   try { return JSON.parse(text); } catch { return {ok:false,raw:text}; }
 }
 
+async function resolveViaTlyExpander(browser, shortUrl) {
+  const context = await browser.newContext({
+    locale: 'en-US',
+    timezoneId: 'Europe/Istanbul',
+    viewport: {width: 1365, height: 900},
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+    ignoreHTTPSErrors: false
+  });
+
+  const page = await context.newPage();
+  const apiUrls = [];
+  const pageUrls = [];
+  let status = 0;
+  let error = '';
+
+  page.on('response', async res => {
+    try {
+      const ct = (res.headers()['content-type'] || '').toLowerCase();
+      if (!ct.includes('json')) return;
+      const text = await res.text();
+      if (text.length > 1500000) return;
+      let data;
+      try { data = JSON.parse(text); } catch { data = text; }
+      extractUrls(data, apiUrls);
+    } catch (_) {}
+  });
+
+  try {
+    const expanderUrl = `https://t.ly/tools/link-expander?url=${encodeURIComponent(shortUrl)}`;
+    const first = await page.goto(expanderUrl, {waitUntil:'domcontentloaded', timeout:45000});
+    if (first) status = first.status();
+
+    // Try to populate the expander form. The page structure may change, so use several selectors.
+    const selectors = [
+      'input[type="url"]',
+      'input[name*="url" i]',
+      'input[placeholder*="url" i]',
+      'input[placeholder*="link" i]'
+    ];
+    let input = null;
+    for (const sel of selectors) {
+      const loc = page.locator(sel).first();
+      if (await loc.count()) { input = loc; break; }
+    }
+    if (!input) {
+      const fallback = page.locator('input').filter({hasNot: page.locator('[type="hidden"]')}).first();
+      if (await fallback.count()) input = fallback;
+    }
+
+    if (input) {
+      await input.fill(shortUrl).catch(()=>{});
+      const buttons = [
+        page.getByRole('button', {name:/expand url/i}).first(),
+        page.getByRole('button', {name:/expand/i}).first(),
+        page.getByRole('button', {name:/unshorten/i}).first(),
+        page.getByRole('button', {name:/check/i}).first(),
+        page.locator('button[type="submit"]').first()
+      ];
+      let clicked = false;
+      for (const b of buttons) {
+        if (await b.count()) {
+          const visible = await b.isVisible().catch(()=>false);
+          if (visible) {
+            await b.click({timeout:5000}).catch(()=>{});
+            clicked = true;
+            break;
+          }
+        }
+      }
+      if (!clicked) await input.press('Enter').catch(()=>{});
+    }
+
+    // Give the server-side expander time to finish and render the redirect chain.
+    await page.waitForLoadState('domcontentloaded', {timeout:15000}).catch(()=>{});
+    await sleep(10000);
+
+    // Prefer URLs returned by the expander's JSON/XHR responses.
+    let finalUrl = pickBestCandidate(apiUrls, shortUrl);
+
+    // If the service rendered results into the page, inspect text + anchors as a fallback.
+    if (!finalUrl) {
+      const bodyText = await page.locator('body').innerText({timeout:5000}).catch(()=> '');
+      extractUrls(bodyText, pageUrls);
+      const hrefs = await page.locator('a[href^="http"]').evaluateAll(nodes => nodes.map(n => n.href)).catch(()=>[]);
+      for (const h of hrefs) if (!pageUrls.includes(h)) pageUrls.push(h);
+      finalUrl = pickBestCandidate(pageUrls, shortUrl);
+    }
+
+    if (!finalUrl) {
+      error = 'T.LY Expander gerçek hedef domaini döndürmedi.';
+      return {ok:false, finalUrl:shortUrl, httpCode:status, error, chain:[...apiUrls, ...pageUrls].slice(-30)};
+    }
+
+    return {ok:true, finalUrl, httpCode:200, error:'', chain:[shortUrl, ...apiUrls, ...pageUrls, finalUrl].slice(-30)};
+  } catch (e) {
+    error = `T.LY Expander fallback hatası: ${String(e && e.message ? e.message : e).slice(0,700)}`;
+    return {ok:false, finalUrl:shortUrl, httpCode:status, error, chain:[]};
+  } finally {
+    await context.close().catch(()=>{});
+  }
+}
+
 async function resolveOne(browser, item) {
   const started = Date.now();
-  const chain = [];
+  let chain = [];
   const sourceHost = hostOf(item.url);
   let finalUrl = item.url;
   let httpCode = 0;
@@ -74,7 +226,6 @@ async function resolveOne(browser, item) {
 
     await activePage.goto(item.url, {waitUntil:'domcontentloaded', timeout:45000});
 
-    // JS redirects / tracker handoffs may happen after DOMContentLoaded.
     let stableUrl = '';
     let stableCount = 0;
     const deadline = Date.now() + 25000;
@@ -86,7 +237,6 @@ async function resolveOne(browser, item) {
       if (now && now !== 'about:blank') finalUrl = now;
       if (finalUrl === stableUrl) stableCount++; else { stableUrl = finalUrl; stableCount = 0; }
       const h = hostOf(finalUrl);
-      // Gerçek hedefte birkaç saniye stabil kaldıysa yeterli.
       if (h && !isIntermediate(h, sourceHost) && stableCount >= 2) break;
     }
 
@@ -98,6 +248,24 @@ async function resolveOne(browser, item) {
     error = String(e && e.message ? e.message : e).slice(0,900);
   } finally {
     if (context) await context.close().catch(()=>{});
+  }
+
+  // v20: T.LY-specific fallback. This does NOT replace normal resolving;
+  // it only runs when direct browser resolution fails on a t.ly short link.
+  if (error && sourceHost === 't.ly') {
+    console.log(`[${item.brand_id}] ${item.name}: direct T.LY resolution failed (HTTP ${httpCode || 0}), trying T.LY Expander fallback...`);
+    const fallback = await resolveViaTlyExpander(browser, item.url);
+    if (fallback.ok) {
+      finalUrl = fallback.finalUrl;
+      httpCode = fallback.httpCode || httpCode;
+      chain = [...chain, ...fallback.chain].slice(-30);
+      error = '';
+      console.log(`[${item.brand_id}] ${item.name}: T.LY Expander fallback OK -> ${hostOf(finalUrl)}`);
+    } else {
+      chain = [...chain, ...fallback.chain].slice(-30);
+      error = `${error} | ${fallback.error}`.slice(0,900);
+      console.log(`[${item.brand_id}] ${item.name}: T.LY Expander fallback FAIL`);
+    }
   }
 
   const payload = {
@@ -119,7 +287,7 @@ async function main() {
   if (!feedRes.ok) throw new Error(`Feed HTTP ${feedRes.status}: ${(await feedRes.text()).slice(0,400)}`);
   const feed = await feedRes.json();
   const items = Array.isArray(feed.items) ? feed.items : [];
-  console.log(`RaskoLink resolver: ${items.length} due brand(s)`);
+  console.log(`RaskoLink resolver v20: ${items.length} due brand(s)`);
   if (!items.length) return;
 
   const browser = await chromium.launch({headless:true, args:['--no-sandbox','--disable-dev-shm-usage']});
